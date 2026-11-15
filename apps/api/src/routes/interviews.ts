@@ -497,7 +497,7 @@ export function interviews(adapters: Adapters): Hono {
 
     try {
       const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("Evaluator timed out after 12s")), 12000)
+        setTimeout(() => reject(new Error("Evaluator timed out after 60s")), 60000)
       );
       const evalResult = await Promise.race([
         evaluateInterview(adapters.ai, interview, { testResults }),
@@ -528,8 +528,10 @@ export function interviews(adapters: Adapters): Hono {
         needsHumanReview: evalResult.needsHumanReview,
         usage,
       });
-    } catch {
-      // Fallback: structured deterministic rubric report
+    } catch (err) {
+      // Fallback: a placeholder report. It is not an evaluation, so it always goes to a human reviewer.
+      const reason = err instanceof Error ? err.message : "unknown error";
+      console.error("[interviews:end] evaluator failed, returning placeholder report:", reason);
       const report: Report = {
         overallScore: 3,
         rubricScores: [
@@ -546,7 +548,8 @@ export function interviews(adapters: Adapters): Hono {
           source: s.source,
           timeMs: s.timeMs,
         })),
-        needsHumanReview: false,
+        needsHumanReview: true,
+        humanReviewReason: `Automatic evaluation failed (${reason}); these scores are placeholders, not an assessment.`,
       };
       await adapters.storage.saveReport(interview.id, report);
 
@@ -558,7 +561,7 @@ export function interviews(adapters: Adapters): Hono {
       const usage = getInterviewUsage(interview.id);
       return c.json({
         report,
-        needsHumanReview: false,
+        needsHumanReview: true,
         usage,
       });
     }
