@@ -3,6 +3,43 @@ import type { Phase } from "@testmeman/contracts";
 import { GoogleGenAI } from "@google/genai";
 import type { ZodType } from "zod";
 
+export const DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite";
+
+/**
+ * Interface representing the subset of GoogleGenAI client used by GeminiModel.
+ * Enables dependency injection for unit testing without network calls.
+ */
+export interface GeminiClientLike {
+  models: {
+    generateContentStream(params: {
+      model: string;
+      contents: { role: string; parts: { text: string }[] }[];
+      config?: Record<string, unknown>;
+    }): Promise<AsyncIterable<{ text?: string | undefined }>>;
+    generateContent(params: {
+      model: string;
+      contents: { role: string; parts: { text: string }[] }[];
+      config?: Record<string, unknown>;
+    }): Promise<{ text?: string | null | undefined }>;
+  };
+}
+
+export interface GeminiModelOptions {
+  apiKey?: string;
+  modelName?: string;
+  client?: GoogleGenAI | GeminiClientLike;
+}
+
+/** Check if an error indicates a 404 / NOT_FOUND condition */
+function isNotFoundError(err: unknown): boolean {
+  const errStr = String(err);
+  return (
+    errStr.includes("404") ||
+    errStr.includes("NOT_FOUND") ||
+    errStr.toLowerCase().includes("not found")
+  );
+}
+
 /**
  * Helper to retry transient Gemini errors (503 Service Unavailable, 429 Rate Limits, Network glitches)
  * with exponential backoff and jitter.
@@ -21,15 +58,17 @@ async function withRetry<T>(
       return await fn();
     } catch (err: unknown) {
       const errStr = String(err);
+      const isNotFound = isNotFoundError(err);
       const isTransient =
-        errStr.includes("503") ||
+        !isNotFound &&
+        (errStr.includes("503") ||
         errStr.includes("429") ||
         errStr.includes("UNAVAILABLE") ||
         errStr.includes("RESOURCE_EXHAUSTED") ||
         errStr.includes("high demand") ||
         errStr.includes("overloaded") ||
         errStr.includes("fetch failed") ||
-        errStr.includes("network");
+        errStr.includes("network"));
 
       if (!isTransient || attempt === maxRetries) {
         throw err;
@@ -52,12 +91,19 @@ async function withRetry<T>(
  * `structured()` uses `generateContent` with JSON response mode.
  */
 export class GeminiModel implements AIModel {
-  private readonly client: GoogleGenAI;
+  private readonly client: any;
   private readonly modelName: string;
 
-  constructor(params: { apiKey: string; modelName?: string }) {
-    this.client = new GoogleGenAI({ apiKey: params.apiKey });
-    this.modelName = params.modelName ?? "gemini-3.1-flash-lite";
+  constructor(params: GeminiModelOptions) {
+    if (params.client) {
+      this.client = params.client;
+    } else {
+      if (!params.apiKey) {
+        throw new Error("GeminiModel requires apiKey when client is not provided");
+      }
+      this.client = new GoogleGenAI({ apiKey: params.apiKey });
+    }
+    this.modelName = params.modelName ?? DEFAULT_GEMINI_MODEL;
   }
 
   async *chat(input: {
@@ -72,23 +118,60 @@ export class GeminiModel implements AIModel {
       parts: [{ text: m.text }],
     }));
 
-    const response = await withRetry(
-      () =>
-        this.client.models.generateContentStream({
-          model: this.modelName,
-          contents,
-          config: {
-            systemInstruction: input.system,
-          },
-        }),
-      { operationName: "GeminiModel.chat" }
-    );
+    const callStream = async (model: string): Promise<AsyncIterable<{ text?: string | undefined }>> => {
+      return (await withRetry(
+        () =>
+          this.client.models.generateContentStream({
+            model,
+            contents,
+            config: {
+              systemInstruction: input.system,
+            },
+          }),
+        { operationName: "GeminiModel.chat" }
+      )) as AsyncIterable<{ text?: string | undefined }>;
+    };
 
-    for await (const chunk of response) {
-      if (input.signal?.aborted) break;
-      const text = chunk.text;
-      if (text) {
-        yield text;
+    let targetModel = this.modelName;
+    let response: AsyncIterable<{ text?: string | undefined }>;
+    try {
+      response = await callStream(targetModel);
+    } catch (err: unknown) {
+      if (isNotFoundError(err) && targetModel !== DEFAULT_GEMINI_MODEL) {
+        console.warn(
+          `[GeminiModel.chat] Model "${targetModel}" not found (404/NOT_FOUND). Retrying with default model "${DEFAULT_GEMINI_MODEL}"...`
+        );
+        targetModel = DEFAULT_GEMINI_MODEL;
+        response = await callStream(targetModel);
+      } else {
+        throw err;
+      }
+    }
+
+    try {
+      for await (const chunk of response) {
+        if (input.signal?.aborted) break;
+        const text = chunk.text;
+        if (text) {
+          yield text;
+        }
+      }
+    } catch (err: unknown) {
+      if (isNotFoundError(err) && targetModel !== DEFAULT_GEMINI_MODEL) {
+        console.warn(
+          `[GeminiModel.chat] Model "${targetModel}" not found during stream. Retrying with default model "${DEFAULT_GEMINI_MODEL}"...`
+        );
+        targetModel = DEFAULT_GEMINI_MODEL;
+        const fallbackStream = await callStream(targetModel);
+        for await (const chunk of fallbackStream) {
+          if (input.signal?.aborted) break;
+          const text = chunk.text;
+          if (text) {
+            yield text;
+          }
+        }
+      } else {
+        throw err;
       }
     }
   }
@@ -113,15 +196,33 @@ export class GeminiModel implements AIModel {
       config.temperature = params.temperature;
     }
 
-    const response = await withRetry(
-      () =>
-        this.client.models.generateContent({
-          model: this.modelName,
-          contents: [{ role: "user", parts: [{ text: fullPrompt }] }],
-          config,
-        }),
-      { operationName: "GeminiModel.structured" }
-    );
+    const callGenerate = async (model: string): Promise<{ text?: string | null | undefined }> => {
+      return (await withRetry(
+        () =>
+          this.client.models.generateContent({
+            model,
+            contents: [{ role: "user", parts: [{ text: fullPrompt }] }],
+            config,
+          }),
+        { operationName: "GeminiModel.structured" }
+      )) as { text?: string | null | undefined };
+    };
+
+    let targetModel = this.modelName;
+    let response: { text?: string | null | undefined };
+    try {
+      response = await callGenerate(targetModel);
+    } catch (err: unknown) {
+      if (isNotFoundError(err) && targetModel !== DEFAULT_GEMINI_MODEL) {
+        console.warn(
+          `[GeminiModel.structured] Model "${targetModel}" not found (404/NOT_FOUND). Retrying with default model "${DEFAULT_GEMINI_MODEL}"...`
+        );
+        targetModel = DEFAULT_GEMINI_MODEL;
+        response = await callGenerate(targetModel);
+      } else {
+        throw err;
+      }
+    }
 
     const text = response.text;
     if (!text) {

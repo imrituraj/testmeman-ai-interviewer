@@ -58,6 +58,10 @@ export interface Storage {
   saveCodeSnapshot(id: string, snap: CodeSnapshot): Promise<void>;
   saveReport(id: string, report: Report): Promise<void>;
   updatePhase?(id: string, phase: Phase): Promise<void>;
+  getReport?(id: string): Promise<Report | null> | Report | null;
+  saveLastSubmission?(id: string, submission: unknown): Promise<void>;
+  saveLastTestResults?(id: string, results: unknown): Promise<void>;
+  deleteInterview?(id: string): Promise<boolean> | boolean;
 }
 
 /**

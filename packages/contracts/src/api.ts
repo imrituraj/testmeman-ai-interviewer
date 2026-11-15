@@ -40,7 +40,7 @@ export const SubmitMessageRequest = z.object({
   text: z.string(),
 });
 
-export const MessageEventType = z.enum(["delta", "turn", "phase", "starterCode", "done"]);
+export const MessageEventType = z.enum(["delta", "turn", "phase", "starterCode", "done", "error"]);
 
 export const MessageEvent = z.object({
   type: MessageEventType,

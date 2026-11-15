@@ -5,6 +5,7 @@ export interface Judge0Options {
   baseUrl?: string | undefined;
   apiKey?: string | undefined;
   rapidApiHost?: string | undefined;
+  returnErrorAsResult?: boolean | undefined;
 }
 
 interface Judge0SubmissionResponse {
@@ -73,11 +74,13 @@ export class Judge0Runner implements CodeRunner {
   private baseUrl: string;
   private apiKey: string | undefined;
   private rapidApiHost: string | undefined;
+  private returnErrorAsResult: boolean;
 
   constructor(options?: Judge0Options | undefined) {
     this.baseUrl = (options?.baseUrl || "https://ce.judge0.com").replace(/\/$/, "");
     this.apiKey = options?.apiKey;
     this.rapidApiHost = options?.rapidApiHost;
+    this.returnErrorAsResult = options?.returnErrorAsResult ?? false;
   }
 
   private getHeaders(): Record<string, string> {
@@ -119,15 +122,50 @@ export class Judge0Runner implements CodeRunner {
 
     // Submit batch to Judge0
     const submitUrl = `${this.baseUrl}/submissions/batch?base64_encoded=true`;
-    const postRes = await fetch(submitUrl, {
-      method: "POST",
-      headers: this.getHeaders(),
-      body: JSON.stringify({ submissions }),
-    });
+    let postRes: Response;
+    try {
+      postRes = await fetch(submitUrl, {
+        method: "POST",
+        headers: this.getHeaders(),
+        body: JSON.stringify({ submissions }),
+      });
+    } catch (err: unknown) {
+      const errMsg = `Judge0 service unreachable: ${String(err)}`;
+      if (this.returnErrorAsResult) {
+        return {
+          results: input.tests.map((test) => ({
+            passed: false,
+            stdout: "",
+            stderr: errMsg,
+            timeMs: 0,
+            hidden: test.hidden,
+            input: test.input,
+            expected: test.expected,
+          })),
+          compileError: errMsg,
+        };
+      }
+      throw new Error(errMsg);
+    }
 
     if (!postRes.ok) {
       const errText = await postRes.text().catch(() => "");
-      throw new Error(`Judge0 submission failed [${postRes.status}]: ${errText}`);
+      const errMsg = `Judge0 submission failed [${postRes.status}]: ${errText}`;
+      if (this.returnErrorAsResult) {
+        return {
+          results: input.tests.map((test) => ({
+            passed: false,
+            stdout: "",
+            stderr: errMsg,
+            timeMs: 0,
+            hidden: test.hidden,
+            input: test.input,
+            expected: test.expected,
+          })),
+          compileError: errMsg,
+        };
+      }
+      throw new Error(errMsg);
     }
 
     const tokensData = (await postRes.json()) as Judge0SubmissionResponse[];
@@ -157,13 +195,17 @@ export class Judge0Runner implements CodeRunner {
       const token = tokens[index];
       const sub = token ? resultsMap.get(token) : undefined;
 
-      if (!sub) {
+      if (!sub || (sub.status_id !== undefined && sub.status_id <= 2)) {
         return {
           passed: false,
-          stdout: "",
-          stderr: "Judge0 result missing",
-          timeMs: 0,
+          stdout: sub ? fromBase64(sub.stdout) : "",
+          stderr: sub?.status?.description
+            ? `Judge0 execution timed out (${sub.status.description})`
+            : "Judge0 execution timed out / result missing",
+          timeMs: sub?.time ? Math.round(parseFloat(sub.time) * 1000) : 0,
           hidden: test.hidden,
+          input: test.input,
+          expected: test.expected,
         };
       }
 
@@ -227,9 +269,14 @@ export class Judge0Runner implements CodeRunner {
     const startTime = Date.now();
 
     while (Date.now() - startTime < maxWaitMs) {
-      const getRes = await fetch(pollUrl, {
-        headers: this.getHeaders(),
-      });
+      let getRes: Response;
+      try {
+        getRes = await fetch(pollUrl, {
+          headers: this.getHeaders(),
+        });
+      } catch (err: unknown) {
+        throw new Error(`Judge0 poll failed: network error ${String(err)}`);
+      }
 
       if (!getRes.ok) {
         const text = await getRes.text().catch(() => "");
@@ -271,20 +318,47 @@ export class Judge0Runner implements CodeRunner {
   }
 }
 
+export interface FallbackRunnerOptions {
+  allowFallback?: boolean;
+}
+
 /**
  * Fallback runner that executes with primary runner and smoothly
  * degrades to backup runner on failure or timeout.
+ * When allowFallback is false (e.g. in production or when CODE_RUNNER=judge0),
+ * it does not call fallback and rethrows the primary runner's error.
  */
 export class FallbackCodeRunner implements CodeRunner {
+  private allowFallback: boolean;
+
   constructor(
     private primary: CodeRunner,
-    private fallback: CodeRunner
-  ) {}
+    private fallback?: CodeRunner,
+    options?: FallbackRunnerOptions | boolean
+  ) {
+    if (typeof options === "boolean") {
+      this.allowFallback = options;
+    } else if (options && typeof options.allowFallback === "boolean") {
+      this.allowFallback = options.allowFallback;
+    } else {
+      const envRunner = typeof process !== "undefined" ? process.env?.CODE_RUNNER : undefined;
+      const allowMockFallback = typeof process !== "undefined" ? process.env?.ALLOW_MOCK_FALLBACK : undefined;
+      if (envRunner === "judge0" && allowMockFallback !== "true") {
+        this.allowFallback = false;
+      } else {
+        this.allowFallback = true;
+      }
+    }
+  }
 
   async run(input: CodeRunnerInput): Promise<CodeRunnerOutput> {
     try {
       return await this.primary.run(input);
     } catch (err) {
+      if (!this.allowFallback || !this.fallback) {
+        console.error("Primary CodeRunner failed and fallback is disabled:", err);
+        throw err;
+      }
       console.warn("Primary CodeRunner failed, using fallback:", err);
       return await this.fallback.run(input);
     }

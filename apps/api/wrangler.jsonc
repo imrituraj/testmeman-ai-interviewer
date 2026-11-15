@@ -1,10 +1,16 @@
 {
   "name": "testmeman-ai-interviewer-api",
   "compatibility_date": "2024-11-15",
-  "node_compat": true,
+  "compatibility_flags": ["nodejs_compat"],
   "main": "src/index.ts",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "testmeman-ai-interviewer-db",
+      "database_id": "testmeman-ai-interviewer-db"
+    }
+  ],
   "vars": {
-    "GEMINI_API_KEY": "",
     "GEMINI_MODEL_INTERVIEWER": "gemini-3.1-flash-lite",
     "GEMINI_MODEL_EVALUATOR": "gemini-3.1-flash-lite",
     "CODE_RUNNER": "judge0",

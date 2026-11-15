@@ -172,6 +172,50 @@ describe("Judge0Runner", () => {
     expect(output.results[0]?.passed).toBe(false);
     expect(output.results[0]?.stderr).toBe("Time Limit Exceeded");
   });
+
+  it("throws when Judge0 service is unreachable (network error)", async () => {
+    globalThis.fetch = vi.fn().mockRejectedValue(new TypeError("fetch failed: ECONNREFUSED"));
+
+    const runner = new Judge0Runner();
+    await expect(
+      runner.run({
+        language: "python",
+        source: "print(1)",
+        tests: [{ input: "", expected: "1", hidden: false }],
+      })
+    ).rejects.toThrow(/Judge0 service unreachable/);
+  });
+
+  it("throws when Judge0 submission returns HTTP 500 error", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response("Internal Server Error", { status: 500 })
+    );
+
+    const runner = new Judge0Runner();
+    await expect(
+      runner.run({
+        language: "python",
+        source: "print(1)",
+        tests: [{ input: "", expected: "1", hidden: false }],
+      })
+    ).rejects.toThrow(/Judge0 submission failed \[500\]/);
+  });
+
+  it("returns compile/runtime error instead of throwing when returnErrorAsResult is true", async () => {
+    globalThis.fetch = vi.fn().mockRejectedValue(new TypeError("fetch failed: ECONNREFUSED"));
+
+    const runner = new Judge0Runner({ returnErrorAsResult: true });
+    const output = await runner.run({
+      language: "python",
+      source: "print(1)",
+      tests: [{ input: "", expected: "1", hidden: false }],
+    });
+
+    expect(output.compileError).toContain("Judge0 service unreachable");
+    expect(output.results).toHaveLength(1);
+    expect(output.results[0]?.passed).toBe(false);
+    expect(output.results[0]?.stderr).toContain("Judge0 service unreachable");
+  });
 });
 
 describe("FallbackCodeRunner", () => {
@@ -197,7 +241,7 @@ describe("FallbackCodeRunner", () => {
     expect(fallback.run).not.toHaveBeenCalled();
   });
 
-  it("falls back when primary runner throws", async () => {
+  it("falls back when primary runner throws and fallback is enabled", async () => {
     const primary: CodeRunner = {
       run: vi.fn().mockRejectedValue(new Error("Judge0 rate limit 429")),
     };
@@ -207,7 +251,7 @@ describe("FallbackCodeRunner", () => {
       }),
     };
 
-    const runner = new FallbackCodeRunner(primary, fallback);
+    const runner = new FallbackCodeRunner(primary, fallback, { allowFallback: true });
     const res = await runner.run({
       language: "python",
       source: "print('ok')",
@@ -218,5 +262,56 @@ describe("FallbackCodeRunner", () => {
     expect(primary.run).toHaveBeenCalledTimes(1);
     expect(fallback.run).toHaveBeenCalledTimes(1);
   });
-});
 
+  it("does NOT fall back and throws when allowFallback is false", async () => {
+    const primary: CodeRunner = {
+      run: vi.fn().mockRejectedValue(new Error("Judge0 service down 503")),
+    };
+    const fallback: CodeRunner = {
+      run: vi.fn().mockResolvedValue({
+        results: [{ passed: true, stdout: "mock fake pass", stderr: "", timeMs: 1, hidden: false }],
+      }),
+    };
+
+    const runner = new FallbackCodeRunner(primary, fallback, { allowFallback: false });
+    await expect(
+      runner.run({
+        language: "python",
+        source: "print('candidate code')",
+        tests: [{ input: "", expected: "ok", hidden: false }],
+      })
+    ).rejects.toThrow("Judge0 service down 503");
+
+    expect(primary.run).toHaveBeenCalledTimes(1);
+    expect(fallback.run).not.toHaveBeenCalled();
+  });
+
+  it("does NOT fall back when CODE_RUNNER=judge0 in environment", async () => {
+    const originalEnv = process.env.CODE_RUNNER;
+    try {
+      process.env.CODE_RUNNER = "judge0";
+      const primary: CodeRunner = {
+        run: vi.fn().mockRejectedValue(new Error("Judge0 unreachable in prod")),
+      };
+      const fallback: CodeRunner = {
+        run: vi.fn().mockResolvedValue({
+          results: [{ passed: true, stdout: "mock pass", stderr: "", timeMs: 1, hidden: false }],
+        }),
+      };
+
+      const runner = new FallbackCodeRunner(primary, fallback);
+      await expect(
+        runner.run({
+          language: "python",
+          source: "print('candidate code')",
+          tests: [{ input: "", expected: "ok", hidden: false }],
+        })
+      ).rejects.toThrow("Judge0 unreachable in prod");
+
+      expect(primary.run).toHaveBeenCalledTimes(1);
+      expect(fallback.run).not.toHaveBeenCalled();
+    } finally {
+      process.env.CODE_RUNNER = originalEnv;
+    }
+  });
+});

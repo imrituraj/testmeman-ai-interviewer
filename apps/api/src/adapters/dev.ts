@@ -235,11 +235,25 @@ export class MemoryStorage implements Storage {
     this.reports.set(id, report);
   }
 
-  getReport(id: string): Report | null {
+  async getReport(id: string): Promise<Report | null> {
     return this.reports.get(id) ?? null;
   }
 
-  deleteInterview(id: string): boolean {
+  async saveLastSubmission(id: string, submission: unknown): Promise<void> {
+    const interview = this.interviews.get(id);
+    if (interview) {
+      (interview as any).lastSubmission = submission;
+    }
+  }
+
+  async saveLastTestResults(id: string, results: unknown): Promise<void> {
+    const interview = this.interviews.get(id);
+    if (interview) {
+      (interview as any).lastTestResults = results;
+    }
+  }
+
+  async deleteInterview(id: string): Promise<boolean> {
     this.reports.delete(id);
     return this.interviews.delete(id);
   }

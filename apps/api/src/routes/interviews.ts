@@ -150,7 +150,7 @@ function shouldAdvance(interview: Interview): boolean {
   }
 }
 
-export function interviews(adapters: Adapters): Hono {
+export function interviews(adapters: Adapters, envConfig?: { ALLOW_MOCK_FALLBACK?: string }): Hono {
   const app = new Hono();
 
   // GET /problems - List available problems
@@ -276,6 +276,14 @@ export function interviews(adapters: Adapters): Hono {
 
     const encoder = new TextEncoder();
     const currentPhase = updatedInterview.phase;
+    const cEnv = c.env as { ALLOW_MOCK_FALLBACK?: string } | undefined;
+    const allowMockFallback =
+      cEnv?.ALLOW_MOCK_FALLBACK !== undefined
+        ? cEnv.ALLOW_MOCK_FALLBACK === "true"
+        : envConfig?.ALLOW_MOCK_FALLBACK !== undefined
+          ? envConfig.ALLOW_MOCK_FALLBACK === "true"
+          : (typeof process !== "undefined" && process.env?.ALLOW_MOCK_FALLBACK === "true");
+
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
         let fullResponse = "";
@@ -295,6 +303,20 @@ export function interviews(adapters: Adapters): Hono {
             }
           } catch (chatError) {
             console.error("[interviews:stream] AI chat error, applying mock fallback:", chatError);
+            const errMsg = chatError instanceof Error ? chatError.message : String(chatError);
+            if (!allowMockFallback) {
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({ type: "error", content: `Interviewer model unavailable: ${errMsg}` })}\n\n`
+                )
+              );
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({ type: "done", content: "" })}\n\n`
+                )
+              );
+              return;
+            }
             if (!fullResponse) {
               const mock = new MockAIModel();
               for await (const chunk of mock.chat({
@@ -371,9 +393,17 @@ export function interviews(adapters: Adapters): Hono {
             )
           );
         } catch (e) {
-          controller.error(e);
+          try {
+            controller.error(e);
+          } catch {
+            // Ignore error if stream controller is already closed or errored
+          }
         } finally {
-          controller.close();
+          try {
+            controller.close();
+          } catch {
+            // Ignore error if stream controller is already closed
+          }
         }
       },
     });
@@ -416,9 +446,12 @@ export function interviews(adapters: Adapters): Hono {
       tests: sampleTests,
     });
 
+    const testResults = result.results.map((r) => ({ passed: r.passed, hidden: r.hidden }));
     if (interview) {
-      (interview as unknown as { lastTestResults?: { passed: boolean; hidden: boolean }[] }).lastTestResults =
-        result.results.map((r) => ({ passed: r.passed, hidden: r.hidden }));
+      (interview as unknown as { lastTestResults?: { passed: boolean; hidden: boolean }[] }).lastTestResults = testResults;
+      if (adapters.storage.saveLastTestResults) {
+        await adapters.storage.saveLastTestResults(interview.id, testResults);
+      }
     }
 
     return c.json(result);
@@ -453,7 +486,7 @@ export function interviews(adapters: Adapters): Hono {
     const allPassed = !result.compileError && passedCount === totalCount;
 
     // Record submission summary and test results on the interview
-    (interview as unknown as { lastSubmission?: unknown }).lastSubmission = {
+    const submissionData = {
       allPassed,
       passedCount,
       totalCount,
@@ -461,8 +494,17 @@ export function interviews(adapters: Adapters): Hono {
       compileError: result.compileError,
       submittedAt: Date.now(),
     };
-    (interview as unknown as { lastTestResults?: { passed: boolean; hidden: boolean }[] }).lastTestResults =
-      result.results.map((r) => ({ passed: r.passed, hidden: r.hidden }));
+    const testResultsData = result.results.map((r) => ({ passed: r.passed, hidden: r.hidden }));
+
+    (interview as unknown as { lastSubmission?: unknown }).lastSubmission = submissionData;
+    (interview as unknown as { lastTestResults?: { passed: boolean; hidden: boolean }[] }).lastTestResults = testResultsData;
+
+    if (adapters.storage.saveLastSubmission) {
+      await adapters.storage.saveLastSubmission(interview.id, submissionData);
+    }
+    if (adapters.storage.saveLastTestResults) {
+      await adapters.storage.saveLastTestResults(interview.id, testResultsData);
+    }
 
     // If currently in intro, problem, or coding phase, advance to followUps on submit
     if (
@@ -573,7 +615,7 @@ export function interviews(adapters: Adapters): Hono {
     const interview = await adapters.storage.getInterview(id);
     if (!interview) return c.json({ error: "Interview not found" }, 404);
 
-    const saved = (adapters.storage as { getReport?: (id: string) => Report | null }).getReport?.(interview.id);
+    const saved = adapters.storage.getReport ? await adapters.storage.getReport(interview.id) : null;
     const usage = getInterviewUsage(interview.id);
 
     if (saved) {
@@ -611,8 +653,7 @@ export function interviews(adapters: Adapters): Hono {
   // DELETE /interviews/:id - Privacy compliance (README Rule 7)
   app.delete("/:id", async (c) => {
     const id = c.req.param("id");
-    const storageWithDelete = adapters.storage as { deleteInterview?: (id: string) => boolean };
-    const deleted = storageWithDelete.deleteInterview?.(id) ?? false;
+    const deleted = adapters.storage.deleteInterview ? await adapters.storage.deleteInterview(id) : false;
     return c.json({ success: deleted });
   });
 
